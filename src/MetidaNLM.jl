@@ -1,6 +1,8 @@
 module MetidaNLM
 
 using LinearAlgebra, LabelledArrays, OrderedCollections, Distributions, DataFrames
+
+using DifferentialEquations
 using MetidaNCA, Optim
 
 import Base: length, size, show
@@ -25,6 +27,7 @@ struct NLModelResult
     ds
 end
 
+# Domain structure - describe domeains - Real, Vector, Matrix, minimal and maximum values of parameters
 struct Domain{Type, T} <: AbstractDomain
     init::T
     lower::T 
@@ -85,135 +88,113 @@ end
 
 
 struct NLModel
-    fixedparams
-    fixeddomain
-    modelparams
+    params       # parameters for optimization
+    domains      # domains list
+    randdepparams # parameterst in params that used in random part
+    randparams   # random parameters
+    randexpr     # expressions for random parameters
+    modelparams  # parameters for model equations
     modelvars
-    modelexpr
-    modelefunc
-    distfunc
+    modelexpr    # model expressions
+    errorexpr    # expreaaion for residual error model
+    modelefunc   # generated model function
+    diffeqvars
+    outparams    # output parameters from model equation
+    diffeqexpr   # differential equation expressions
+    initsvals    # initial values
+    diffeqfunc   # solution for differential equations
+    distfunc     # function to make distributiions
 end
-
-function modelfunc(mexpr, pexpr, args, params, vars)
-    pex = Expr(:tuple, params...)
-    aex = Expr(:tuple, args...)
+# This function make model function from expressions and lists of parameters
+# Make function f(t, model_parameters, indivdual_random_parasmeters)
+function modelfunc(modelexpr, postexpr, modelparams, randparams, modelvars)
+    modelvars_tuple = tuple(modelvars...)
     x = quote
-        function ($aex...)
-            $(mexpr)
-            $(pexpr)
-            $pex
+        function generated_function(t, fixed_params, random_params)
+            $([:(local $v = fixed_params.$v)  for v in modelparams]...)
+            $([:(local $v = random_params.$v) for v in randparams]...)
+            $(modelexpr)
+            $(postexpr)
+            return NamedTuple{$modelvars_tuple}($(Expr(:tuple, modelvars...)))
         end
     end
     eval(x)
 end
 
-function modeldistfunc(mexpr, pexpr, dexpr, args, params, vars)
-    pex = Expr(:tuple, params...)
-    aex = Expr(:tuple, args...)
+# calculate model values for subject s and model m with parameters p, and individual random effect r (if r == Nothing random parameters will be generated)
+# 
+function subjectmodelvals(m::NLModel, s, p, r = Nothing)
+    # <- CODE HERE to get individual random values, if r is nothing make zero values
+    map(s.time) do t m.modelefunc(t, p, r) end
+end
+
+# generate tuple of random parameters equals zero  
+function genrandpzeros(m::NLModel)
+    # <- CODE HERE !!! 
+end
+
+# make distribution for random effects model m with parameters p
+function randdistfunc(m::NLModel, p)
+    # <- CODE HERE !!! 
+end
+
+# generate function to evaluate model  and get distributions for observation model (residuals) 
+function modeldistfunc(modelexpr, postexpr, params, randparams, modelvars, errorexpr)
+    modelvars_tuple = tuple(modelvars...)
     x = quote
-        function (time, $aex...)
-            map(time) do t
-                $(mexpr)
-                $(pexpr)
-                $(dexpr)
-            end
+        function (t, params, random_params)
+            $([:(local $v = params.$v)  for v in params]...)
+            $([:(local $v = random_params.$v) for v in randparams]...)
+            $(modelexpr)
+            $(postexpr)
+            $(errorexpr)
+            # return only last distribution (should be corrected)
+        end
+    end
+    eval(x)
+end
+
+# calculate model values for subject s and model m with parameters p, and individual random effect r (if r == Nothing random parameters will be generated) adnd make distributions
+# 
+function subjectmodeldistvals(m::NLModel, s, p, r = Nothing)
+    # <- CODE HERE to get individual random values, if r is nothing make zero values
+    map(s.time) do t m.distfunc(t, p, r) end
+end
+
+
+
+# TBD 
+function diffeqfunk(diffeqexpr, diffeqvars, params)
+    x = quote
+        function (du, u, p, t)
+
+            $(Expr(:block, [:($(v) = p.$v) for v in params]...))
+
+            $(Expr(:block, [:($(v) = u.$v) for v in diffeqvars]...))
+
+            $(Expr(:block, [:(du[$(QuoteNode(k))] = $(v)) for (k,v) in diffeqexpr]...))
         end
     end
     eval(x)
 end
 
 
-# Optimization vector length and initials
-function optvec(model::NLModel)
-    i = 0
-    s = Symbol[]
-    m = Dict()
-    for (k,d) in model.fixeddomain
-        i += length(d)
-        if size(d) == ()
-            push!(s, k)
-            m[k] = k => 0
-        else
-            for j = 1:length(d)
-                sind = Symbol(string(k)*"_"*replacedigits(string(j)))
-                push!(s, sind)
-                m[sind] = k => j
-            end
-        end
-    end
-    i,s,m
-end
 
-
-function subjlogpdfsum(subject, model, params)
-    dists = model.distfunc(subject.time, ntconv(params, tuple(model.fixedparams...))...)
-    obs = MetidaNCA.getobs(subject)
-    res = 0.0
-    for i = 1:length(dists)
-        res += logpdf(dists[i], obs[i])
-    end
-    res
-end
-
-function fit(subject::S, model) where S <: PKSubject
-    n, names, m = optvec(model)
-    inits       = @LArray zeros(n) tuple(names...)
-    lb = similar(inits)
-    ub = similar(inits)
-    for name in names
-        if size(model.fixeddomain[name]) == ()
-            inits[name] = model.fixeddomain[name].init
-            lb[name] = model.fixeddomain[name].lower
-            ub[name] = model.fixeddomain[name].upper
-        else
-            inits[name] = model.fixeddomain[m[name][1]].init[m[name][2]]
-            lb[name] = model.fixeddomain[m[name][1]].lower[m[name][2]]
-            ub[name] = model.fixeddomain[m[name][1]].upper[m[name][2]]
-        end
-    end
-
-    optfunnk(x) = -subjlogpdfsum(subject, model, x)
-
-    inner_optimizer = NelderMead()
-    
-    #return optfunnk, inits, lb, ub
-    results = optimize(optfunnk, lb, ub, inits, Fminbox(inner_optimizer))
-
-    PKSubjectParameters(Optim.minimizer(results), subject.id)
-end
-
-function fit(data::D, model) where D <: DataSet
-    df = DataFrame([name => Float64[] for name in model.fixedparams])
-    ds = DataSet(PKSubjectParameters[])
-    for s in getdata(data)
-        res = fit(s, model) 
-        push!(df, res.parameters)
-        push!(ds, res)
-    end
-    idk = idkeys(data)
-    for k in idk
-        df[!, k] = getid(data, :, k)
-    end
-
-    NLModelResult(ds, df)
-end
-
-
+# show functions:
 function Base.show(io::IO, m::NLModel) 
     println("    Non-linear model")
-    print("Parameters: $(first(m.fixedparams))")
-    if length(m.fixedparams) > 1
-        for i  = 2:length(m.fixedparams)
-             print(", ", m.fixedparams[i])
+    print("Parameters: $(first(m.params))")
+    if length(m.params) > 1
+        for i  = 2:length(m.params)
+             print(", ", m.params[i])
         end
     end
     println()
-    for p in m.fixedparams
-        println("    ", p, " ∈ ", m.fixeddomain[p])
+    for p in m.params
+        println("    ", p, " ∈ ", m.domains[p])
     end
     println("Variables: $(string(m.modelvars))")
 end
-
 function Base.show(io::IO, d::Domain{Real, T}) where T
     print("Real Domain")
 end
@@ -223,11 +204,11 @@ end
 function Base.show(io::IO, d::Domain{Matrix, T}) where T
     print("Matrix Domain")
 end
-
 function Base.show(io::IO, m::NLModelResult) 
     show(io, m.ds) 
 end
 
+# include file with macro code
     include("macros.jl")
 
 end
